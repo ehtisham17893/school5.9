@@ -3119,4 +3119,315 @@ class Invoice extends Admin_Controller
         exit;
     }
 
+    public function invoiceBulkCreate()
+    {
+        if(($this->data['siteinfos']->school_year == $this->session->userdata('defaultschoolyearID')) || ($this->session->userdata('usertypeID') == 1) || ($this->session->userdata('defaultschoolyearID') == 5)) {
+            $this->data['headerassets'] = [
+                'css' => [
+                    'assets/datepicker/datepicker.css',
+                    'assets/select2/css/select2.css',
+                    'assets/select2/css/select2-bootstrap.css'
+                ],
+                'js' => [
+                    'assets/datepicker/datepicker.js',
+                    'assets/select2/select2.js'
+                ]
+            ];
+
+            $this->data['classes']  = $this->classes_m->general_get_classes();
+            $this->data['feetypes'] = $this->feetypes_m->get_feetypes();
+            $this->data["subview"]  = "invoice/invoice_bulk_create";
+            $this->load->view('_layout_main', $this->data);
+        } else {
+            $this->data["subview"] = "error";
+            $this->load->view('_layout_main', $this->data);
+        }
+    }
+
+    public function getBulkCreateGrid()
+    {
+        header('Content-Type: application/json; charset=utf-8');
+        $retArray = ['status' => FALSE, 'students' => [], 'feetypes' => [], 'grid' => [], 'error' => ''];
+
+        try {
+            $classesID  = $this->input->post('classesID');
+            $sectionID  = $this->input->post('sectionID');
+            $feetypeIDs = $this->input->post('feetypeIDs');
+            $schoolyearID = $this->session->userdata('defaultschoolyearID');
+
+            if (!(int)$classesID) {
+                $retArray['error'] = $this->lang->line('class_required');
+                echo json_encode($retArray);
+                exit;
+            }
+
+            $feetypeIDs = is_array($feetypeIDs) ? $feetypeIDs : (empty($feetypeIDs) ? [] : json_decode($feetypeIDs, true));
+            $feetypeIDs = array_values(array_filter(array_map('intval', (array)$feetypeIDs)));
+
+            if (!customCompute($feetypeIDs)) {
+                $retArray['error'] = $this->lang->line('invoice_feetype_required');
+                echo json_encode($retArray);
+                exit;
+            }
+
+            $studentFilter = [
+                'srclassesID'    => $classesID,
+                'srschoolyearID' => $schoolyearID
+            ];
+            if ((int)$sectionID) {
+                $studentFilter['srsectionID'] = $sectionID;
+            }
+
+            $students = $this->studentrelation_m->get_order_by_student($studentFilter);
+            if (!customCompute($students)) {
+                $retArray['error'] = $this->lang->line('invoice_no_students');
+                echo json_encode($retArray);
+                exit;
+            }
+
+            $allFeetypes = pluck($this->feetypes_m->get_feetypes(), 'obj', 'feetypesID');
+            $feetypes = [];
+            foreach ($feetypeIDs as $ftID) {
+                if (isset($allFeetypes[$ftID])) {
+                    $feetypes[] = [
+                        'feetypeID' => (int)$ftID,
+                        'feetypes'  => $allFeetypes[$ftID]->feetypes
+                    ];
+                }
+            }
+
+            if (!customCompute($feetypes)) {
+                $retArray['error'] = $this->lang->line('invoice_feetype_required');
+                echo json_encode($retArray);
+                exit;
+            }
+
+            $existingByKey = [];
+            $existingInvoices = $this->invoice_m->get_order_by_invoice([
+                'classesID'    => $classesID,
+                'schoolyearID' => $schoolyearID,
+                'deleted_at'   => 1
+            ]);
+            if (customCompute($existingInvoices)) {
+                foreach ($existingInvoices as $inv) {
+                    if (!in_array((int)$inv->feetypeID, $feetypeIDs, true)) {
+                        continue;
+                    }
+                    $key = (int)$inv->studentID . '_' . (int)$inv->feetypeID;
+                    $existingByKey[$key] = [
+                        'invoiceID'     => (int)$inv->invoiceID,
+                        'maininvoiceID' => (int)$inv->maininvoiceID,
+                        'amount'        => (float)$inv->amount
+                    ];
+                }
+            }
+
+            usort($students, function ($a, $b) {
+                $rollCmp = strnatcasecmp((string)($a->srroll ?? ''), (string)($b->srroll ?? ''));
+                if ($rollCmp !== 0) {
+                    return $rollCmp;
+                }
+                return strcasecmp((string)($a->srname ?? ''), (string)($b->srname ?? ''));
+            });
+
+            $grid = [];
+            foreach ($students as $student) {
+                $sid = (int)$student->srstudentID;
+                $row = [
+                    'studentID' => $sid,
+                    'name'      => $student->srname ?? '',
+                    'roll'      => $student->srroll ?? '',
+                    'section'   => $student->srsection ?? '',
+                    'cells'     => []
+                ];
+                foreach ($feetypes as $ft) {
+                    $key = $sid . '_' . $ft['feetypeID'];
+                    $cell = ['exists' => false, 'amount' => 0, 'invoiceID' => null];
+                    if (isset($existingByKey[$key])) {
+                        $cell = [
+                            'exists'    => true,
+                            'amount'    => $existingByKey[$key]['amount'],
+                            'invoiceID' => $existingByKey[$key]['invoiceID']
+                        ];
+                    }
+                    $row['cells'][$ft['feetypeID']] = $cell;
+                }
+                $grid[] = $row;
+            }
+
+            $retArray['status']   = TRUE;
+            $retArray['students'] = $students;
+            $retArray['feetypes'] = $feetypes;
+            $retArray['grid']     = $grid;
+        } catch (Exception $e) {
+            $retArray['error'] = $e->getMessage();
+        } catch (Throwable $e) {
+            $retArray['error'] = $e->getMessage();
+        }
+        echo json_encode($retArray);
+        exit;
+    }
+
+    public function saveBulkCreate()
+    {
+        header('Content-Type: application/json; charset=utf-8');
+        $retArray = ['status' => FALSE, 'message' => '', 'created' => 0, 'skipped' => 0];
+
+        if(($this->data['siteinfos']->school_year != $this->session->userdata('defaultschoolyearID')) && ($this->session->userdata('usertypeID') != 1) && ($this->session->userdata('defaultschoolyearID') != 5)) {
+            $retArray['message'] = $this->lang->line('invoice_permission');
+            echo json_encode($retArray);
+            exit;
+        }
+
+        if (!permissionChecker('invoice_add')) {
+            $retArray['message'] = $this->lang->line('invoice_permission');
+            echo json_encode($retArray);
+            exit;
+        }
+
+        $classesID = $this->input->post('classesID');
+        $date      = $this->input->post('date');
+        $items     = $this->input->post('items');
+
+        if (!(int)$classesID) {
+            $retArray['message'] = $this->lang->line('class_required');
+            echo json_encode($retArray);
+            exit;
+        }
+        if (empty($date)) {
+            $retArray['message'] = $this->lang->line('invoice_date_required');
+            echo json_encode($retArray);
+            exit;
+        }
+
+        $items = is_array($items) ? $items : json_decode((string)$items, true);
+        if (!customCompute($items)) {
+            $retArray['message'] = $this->lang->line('invoice_enter_create_amount');
+            echo json_encode($retArray);
+            exit;
+        }
+
+        $schoolyearID = $this->session->userdata('defaultschoolyearID');
+        $feetypeMap   = pluck($this->feetypes_m->get_feetypes(), 'feetypes', 'feetypesID');
+        $dateFormatted = date('Y-m-d', strtotime($date));
+        $createDate    = date('Y-m-d');
+        $dateTs        = strtotime($dateFormatted);
+        $day           = date('d', $dateTs);
+        $month         = date('m', $dateTs);
+        $year          = date('Y', $dateTs);
+        $userID        = $this->session->userdata('loginuserID');
+        $usertypeID    = $this->session->userdata('usertypeID');
+        $uname         = $this->session->userdata('name');
+
+        // Group fee lines by student
+        $byStudent = [];
+        foreach ($items as $item) {
+            $studentID = isset($item['studentID']) ? (int)$item['studentID'] : 0;
+            $feetypeID = isset($item['feetypeID']) ? (int)$item['feetypeID'] : 0;
+            $amount    = isset($item['amount']) ? (float)$item['amount'] : 0;
+            if ($studentID && $feetypeID && $amount > 0 && isset($feetypeMap[$feetypeID])) {
+                if (!isset($byStudent[$studentID])) {
+                    $byStudent[$studentID] = [];
+                }
+                $byStudent[$studentID][] = [
+                    'feetypeID' => $feetypeID,
+                    'feetype'   => $feetypeMap[$feetypeID],
+                    'amount'    => $amount
+                ];
+            }
+        }
+
+        if (!customCompute($byStudent)) {
+            $retArray['message'] = $this->lang->line('invoice_enter_create_amount');
+            echo json_encode($retArray);
+            exit;
+        }
+
+        $created = 0;
+        $skipped = 0;
+
+        foreach ($byStudent as $studentID => $feeLines) {
+            $validLines = [];
+            foreach ($feeLines as $line) {
+                $existing = $this->invoice_m->get_single_invoice([
+                    'classesID'    => $classesID,
+                    'studentID'    => $studentID,
+                    'feetypeID'    => $line['feetypeID'],
+                    'schoolyearID' => $schoolyearID,
+                    'deleted_at'   => 1
+                ]);
+                if ($existing) {
+                    $skipped++;
+                    continue;
+                }
+                $validLines[] = $line;
+            }
+
+            if (!customCompute($validLines)) {
+                continue;
+            }
+
+            $maininvoiceID = $this->maininvoice_m->insert_maininvoice([
+                'maininvoiceschoolyearID' => $schoolyearID,
+                'maininvoiceclassesID'    => $classesID,
+                'maininvoicestudentID'    => $studentID,
+                'maininvoicestatus'       => 0,
+                'maininvoiceuserID'       => $userID,
+                'maininvoiceusertypeID'   => $usertypeID,
+                'maininvoiceuname'        => $uname,
+                'maininvoicedate'         => $dateFormatted,
+                'maininvoicecreate_date'  => $createDate,
+                'maininvoiceday'          => $day,
+                'maininvoicemonth'        => $month,
+                'maininvoiceyear'         => $year,
+                'maininvoicedeleted_at'   => 1
+            ]);
+
+            if (!$maininvoiceID) {
+                continue;
+            }
+
+            $invoiceArray = [];
+            foreach ($validLines as $line) {
+                $invoiceArray[] = [
+                    'schoolyearID'  => $schoolyearID,
+                    'classesID'     => $classesID,
+                    'studentID'     => $studentID,
+                    'feetypeID'     => $line['feetypeID'],
+                    'feetype'       => $line['feetype'],
+                    'amount'        => $line['amount'],
+                    'discount'      => 0,
+                    'paidstatus'    => 0,
+                    'userID'        => $userID,
+                    'usertypeID'    => $usertypeID,
+                    'uname'         => $uname,
+                    'date'          => $dateFormatted,
+                    'create_date'   => $createDate,
+                    'day'           => $day,
+                    'month'         => $month,
+                    'year'          => $year,
+                    'deleted_at'    => 1,
+                    'maininvoiceID' => $maininvoiceID
+                ];
+                $created++;
+            }
+
+            if (customCompute($invoiceArray)) {
+                $this->invoice_m->insert_batch_invoice($invoiceArray);
+            }
+        }
+
+        $retArray['status']  = TRUE;
+        $retArray['created'] = $created;
+        $retArray['skipped'] = $skipped;
+        $retArray['message'] = $created . ' ' . $this->lang->line('invoices_created');
+        if ($skipped > 0) {
+            $retArray['message'] .= ', ' . $skipped . ' ' . $this->lang->line('invoices_skipped');
+        }
+
+        $this->session->set_flashdata('success', $retArray['message']);
+        echo json_encode($retArray);
+        exit;
+    }
+
 }
